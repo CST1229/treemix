@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>treemix</title>
+	<style>
+		body {
+			font-family: "Helvetica Neue", Arial, Helvetica, sans-serif;
+		}
+		#projectInput {
+			width: min(26em, 100vw - 8em);
+		}
+		#errorText {
+			font-weight: bold;
+			color: red;
+		}
+		.settingExplanation {
+			margin-top: 0;
+			margin-left: 1.5rem;
+			color: gray;
+			font-size: 75%;
+		}
+
+		button {
+			cursor: pointer;
+		}
+		button:disabled {
+			cursor: default;
+		}
+		#exportURL[href="#"], #exportURL[href="#"] button {
+			cursor: default;
+			pointer-events: none;
+		}
+		
+		.tree-viewer-text, .tree-viewer-textCompact {
+			white-space: pre;
+			font-family: monospace;
+		}
+		
+		/* Scratch remix tree styles */
+		.tree-viewer-scratch #tree {
+			overflow-y: hidden;
+			overflow-x: hidden;
+			background-color: #ffffff;
+			width: 940px;
+			height: 500px;
+			float: left;
+			position: relative;
+		}
+		.tree-viewer-scratch {
+			height: 500px;
+		}
+		.tree-viewer-scratch #textOverlay {
+			height: 100%;
+			width: 100%;
+			position: absolute;
+			top: -16px;
+			left: 0px;
+			pointer-events: none;
+		}
+		.tree-viewer-scratch .overText {
+			position: absolute;
+			white-space: nowrap;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			-o-text-overflow: ellipsis;
+		}
+		.tree-viewer-scratch .boldText {
+			font-weight: bold;
+		}
+		.tree-viewer-scratch .clickable {
+			cursor: pointer;
+		}
+
+		.tree-viewer-scratch .zoom {
+			float:right;
+			cursor: pointer;
+			background-repeat: no-repeat;
+		}
+
+		.tree-viewer-scratch .zoom:hover {
+			margin-top:-21px;
+		}
+
+		.tree-viewer-scratch #zoomContainer {
+			width:77px;
+			height:21px;
+			position: absolute;
+			top: 5px;
+			overflow: hidden;
+		}
+	</style>
+</head>
+<body>
+	<noscript>you need JavaScript enabled by the way</noscript>
+	<h1>treemix (remix trees but unofficial)</h1>
+	<p>made by <a href="https://scratch.mit.edu/users/CST1229" target="_blank">@CST1229</a></p>
+	<p><a href="https://github.com/CST1229/treemix" target="_blank">source code</a></p>
+
+	<div><input type="text" placeholder="Scratch project URL or ID number" id="projectInput"> <button id="goButton">go!</button></div>
+	<div>
+		or...
+		<input type="file" id="filePicker" style="display: none" accept=".json">
+		<a href="#" id="exportURL"><button tabindex="-1" disabled id="exportButton">export JSON</button></a>
+		<button id="importButton">import from exported JSON</button>
+	</div>
+	<div>
+		<label>
+			Tree viewer:
+			<select id="treeViewer">
+				<option value="scratch">Scratch's</option>
+				<option value="text">Text-based list</option>
+				<option value="textCompact">Text-based list (compact)</option>
+			</select>
+		</label>
+	</div>
+	<!-- apparently the API actually just returns 0 for all remixes, so this option isn't feasible
+	<label>
+		<input type="checkbox" id="trustAPICheckbox">
+		Trust Scratch API remix count (faster, may miss some projects)
+		<p class="settingExplanation">
+			If enabled, the tool will skip scanning projects that the remix list says have a remix count of 0.
+			Said count isn't fully accurate, so some projects that do actually have remixes might be missing in the output.
+		</p>
+	</label>
+	-->
+	
+	<br/>
+	<div id="statusText"></div>
+	<div id="queueText"></div>
+	<div id="errorText"></div>
+	<br/>
+
+	<div id="treeContainer" class="tree-container"></div>
+
+	<script type="module">
+		const MS_PER_REQUEST = 750;
+		let trustAPI = false;
+
+		let going = false;
+		let stopping = false;
+
+		function setError(status) {
+			errorText.textContent = status;
+		}
+		function setStatus(status) {
+			statusText.textContent = status;
+		}
+		let apiTimeout = null;
+		async function waitRate() {
+			if (apiTimeout) {
+				const oldStatus = statusText.textContent;
+				setStatus((oldStatus + " (waiting for ratelimit...)").trimStart());
+				await apiTimeout;
+				setStatus(oldStatus);
+			}
+			apiTimeout = new Promise(res => setTimeout(res, MS_PER_REQUEST));
+		}
+		function updateQueue(queue) {
+			if (queue.length === 0) {
+				queueText.textContent = "";
+				return;
+			}
+			const text = queue.map((j, i) => i === 0 ? `[[${j.id}]]` : `${j.id}`).join(", ");
+			queueText.textContent = `${queue.length} project${queue.length === 1 ? "" : "s"} in queue: ${text}`;
+		}
+
+		async function makeApiRequest(url) {
+			let resp;
+			try {
+				resp = await fetch(url);
+			} catch(e) {
+				setError(`request to ${url} failed! ${e}`);
+				console.error(url, e);
+				return null;
+			}
+			if (!resp.ok) {
+				const text = await resp.text();
+				setError(`request to ${url} received status ${resp.status} ${resp.statusText} - content: ${text}`);
+				console.error(url, text);
+				return null;
+			}
+			try {
+				return await resp.json();
+			} catch(e) {
+				const text = await resp.text();
+				setError(`request to ${url} received invalid json - content: ${text}`);
+				console.error(url, text);
+				return null;
+			}
+		}
+		function fetchProject(id) {
+			if (isNaN(id)) {
+				throw new TypeError(`fetchProject: ${id} is not a number`);
+			}
+			return makeApiRequest(`https://trampoline.turbowarp.org/api/projects/${id}`);
+		}
+		async function fetchRemixes(project, queue) {
+			if (!going) return [];
+			
+			const id = (project || {}).id;
+			if (isNaN(id)) {
+				throw new TypeError(`fetchRemixes: ${id} is not a number`);
+			}
+
+			const remixCount = project.stats.remixes;
+			if (trustAPI && remixCount <= 0) {
+				return [];
+			}
+			const LIMIT = remixCount < 10 ? 20 : 40;
+
+			let maxPages = Math.max(1, Math.ceil(remixCount / LIMIT)).toString();
+			if (!trustAPI) {
+				maxPages += "?";
+			}
+			let offset = 0;
+			let page = 1;
+
+			let resp;
+			const remixes = [];
+			do {
+				setStatus(`Fetching page ${page}/${maxPages} of remixes...`);
+				await waitRate();
+
+				let url = `https://api.scratch.mit.edu/projects/${id}/remixes?${
+					LIMIT === 20 ? "" : `limit=${LIMIT}&`
+				}${
+					offset > 0 ? `offset=${offset}&` : ""
+				}`;
+				if (url.endsWith("&")) url = url.slice(0, -1);
+				if (url.endsWith("?")) url = url.slice(0, -1);
+
+				resp = await makeApiRequest(`https://corsproxy.io/?url=${encodeURIComponent(url)}`);
+				if (resp) {
+					remixes.push(...resp);
+					for (const remix of resp) {
+						if (!trustAPI || remix.stats.remixes > 0) {
+							queue.push(remix);
+						}
+					}
+					updateQueue(queue);
+				}
+				offset += LIMIT;
+				page++;
+			} while (going && resp && resp.length == LIMIT && (!trustAPI || (offset + LIMIT) < remixCount));
+			return remixes;
+		};
+		
+		let lastObjectURL = "";
+		let visualizedData = null;
+		projectInput.onkeydown = function(/** @type {KeyboardEvent} */ ev) {
+			if (ev.key === "Enter" && !goButton.disabled) {
+				goButton.click();
+			}
+		};
+		goButton.onclick = async function() {
+			if (stopping) return;
+			if (going) {
+				stopping = true;
+				going = false;
+				goButton.disabled = true;
+				goButton.textContent = "stopping...";
+				return;
+			}
+			going = true;
+			goButton.textContent = "stop!";
+			setError("");
+
+			const match = String(projectInput.value).match(/\d+/);
+			if (!match) {
+				setError("no numbers inputted");
+				return;
+			}
+
+			setStatus("");
+			updateQueue([]);
+			treeContainer.textContent = "";
+			visualizedData = null;
+
+			let data = null;
+			importButton.disabled = true;
+			try {
+				data = await getRemixTree(+match[0]);
+			} catch(e) {
+				setError(`something went really wrong with fetching! ${e}`);
+				console.log(e);
+				return;
+			} finally {
+				setStatus("");
+				going = false;
+				stopping = false;
+				goButton.disabled = false;
+				importButton.disabled = false;
+				goButton.textContent = "go!";
+			}
+
+			if (data) {
+				try {
+					await visualizeRemixTree(data);
+				} catch(e) {
+					setError(`something went really wrong with visualization! ${e}`);
+					console.log(e);
+					return;
+				}
+			}
+		};
+		importButton.onclick = function() {
+			filePicker.value = null;
+			filePicker.click();
+		};
+		filePicker.onchange = async function() {
+			if (filePicker.files.length) {
+				/** @type {File} */
+				const file = filePicker.files[0];
+				let text, data;
+				try {
+					text = await file.text();
+				} catch(e) {
+					setError(`something went really wrong with reading the file! ${e}`);
+					console.log(e);
+					return;
+				}
+
+				try {
+					data = JSON.parse(text);
+				} catch(e) {
+					setError(`file doesn't seem to be valid JSON. ${e}`);
+					console.log(e);
+					return;
+				}
+
+				try {
+					setError("");
+					setStatus("");
+					updateQueue([]);
+					exportButton.disabled = false;
+					treeContainer.textContent = "";
+					visualizedData = null;
+					visualizeRemixTree(data);
+				} catch(e) {
+					setError(`something went really wrong with visualization! are you sure this file was exported from this tool? ${e}`);
+					console.log(e);
+					return;
+				}
+			}
+		};
+
+		
+		async function getRemixTree(rootId) {
+			setStatus("Fetching main project...");
+			await waitRate();
+			const mainJson = await fetchProject(rootId);
+			if (!mainJson) return null;
+			delete mainJson.project_token;
+			const queue = [mainJson];
+
+			window.treemixProject = mainJson;
+			window.treemixQueue = queue;
+			
+			updateQueue(queue);
+			while (queue.length > 0) {
+				const currentProject = queue[0];
+				currentProject.remixes = await fetchRemixes(currentProject, queue);
+				queue.shift();
+				updateQueue(queue);
+			}
+			return mainJson;
+		}
+
+		const treeViewers = {
+			scratch: treeScratch,
+			text: treeText,
+			textCompact: treeTextCompact,
+		};
+
+		treeViewer.onchange = function() {
+			if (visualizedData) visualizeRemixTree(visualizedData);
+		};
+		function visualizeRemixTree(data) {
+			setStatus("");
+			if (lastObjectURL) {
+				URL.revokeObjectURL(lastObjectURL);
+				lastObjectURL = "";
+			}
+			visualizedData = data;
+			const blob = new Blob([JSON.stringify(data)], {type: "application/json"});
+			lastObjectURL = URL.createObjectURL(blob);
+			exportURL.href = lastObjectURL;
+			exportURL.download = data.id + "-remixtree.json";
+			exportButton.disabled = false;
+			
+			treeContainer.textContent = "";
+			const viewer = treeViewer.value;
+			treeContainer.className = "tree-container";
+			if (!treeViewers.hasOwnProperty(viewer)) {
+				setError(`Tree viewer ${viewer} not found.`);
+				return;
+			}
+			treeContainer.classList.add("tree-viewer-" + viewer);
+			treeViewers[viewer](data);
+		}
+
+		function convertDataForScratch(data, newData, parentId) {
+			function makeDate(date) {
+				return new Date(date).toLocaleString("en-US", {
+					month: "short",
+					day: "numeric",
+					year: "numeric",
+					hour: "numeric",
+					minute: "numeric",
+				});
+			}
+			newData[data.id] = {
+				"title": data.title,
+				"creator": data.author.username,
+				"favorite_count": data.stats.favorites,
+				"love_count": data.stats.loves,
+				"parent_id": parentId,
+				"visibility": "visible",
+				"moderation_status": "safe",
+				"is_published": true,
+				"children": data.remixes.map(r => r.id.toString()),
+			};
+			for (const remix of data.remixes) {
+				convertDataForScratch(remix, newData, data.id);
+			}
+		}
+		let loadedTreeJs = false;
+		let treeURL = "";
+		async function treeScratch(data) {
+			if (treeURL) {
+				URL.revokeObjectURL(treeURL);
+				treeURL = "";
+			}
+
+			const treeDiv = document.createElement("div");
+			treeDiv.id = "tree";
+			treeContainer.appendChild(treeDiv);
+
+
+			const newData = {};
+			newData.id = data.id;
+			// this would require fetching the root project. i am not doing that yet
+			const USE_ROOT = false;
+			if (USE_ROOT) {
+				newData.root_id = data.remix.root || data.id;
+				convertDataForScratch(data, newData, data.remix.parent || null);
+			} else {
+				newData.root_id = data.id;
+				convertDataForScratch(data, newData, null);
+			}
+
+			window.scratchTreeData = newData;
+
+			window.navData = [];
+			window.Scratch = {};
+			Scratch.INIT_DATA = {};
+			Scratch.INIT_DATA.GLOBAL_URLS = {
+				"media_url": "https://uploads.scratch.mit.edu/",
+				"static_url": "https://cdn.scratch.mit.edu/scratchr2/static/__5b3e40ec58a840b41702360e9891321b__/",
+				"static_path": "https://scratch.mit.edu/scratchr2/static/__5b3e40ec58a840b41702360e9891321b__/"
+			};
+			treeURL = URL.createObjectURL(new Blob([JSON.stringify(newData)], {type: "text/plain"}));
+
+			if (!loadedTreeJs) {
+				loadedTreeJs = true;
+				setStatus("Loading libraries...");
+				function loadScript(src) {
+					const script = document.createElement("script");
+					script.src = src;
+					document.body.appendChild(script);
+					return new Promise((res, rej) => {
+						script.onload = res;
+						script.onerror = rej;
+					});
+				}
+				await loadScript("./lib/jquery.min.js");
+				await loadScript("./lib/treejs.js");
+			}
+			setStatus("Constructing tree...");
+			window.buildTree(treeURL, data.id);
+			setStatus("(NOTE: unlike the actual Scratch remix tree viewer, parent remixes aren't visible)");
+		}
+
+
+		function treeText(data) {
+			treeContainer.textContent = _treeTextRecursive(data, false);
+		}
+		function treeTextCompact(data) {
+			treeContainer.textContent = _treeTextRecursive(data, true);
+		}
+		function _treeTextRecursive(data, compact = false, treeLine = "", deepTreeLine = "") {
+			if (compact) {
+				treeLine = treeLine.slice(0, -1);
+				deepTreeLine = deepTreeLine.slice(0, -1);
+			}
+			let text = "";
+			text += `${treeLine}(${data.id}) "${data.title}" by ${data.author.username}\n`;
+			for (let i = 0; i < data.remixes.length; i++) {
+				const remix = data.remixes[i];
+				// padding
+				// text += deepTreeLine + "│ " + "\n";
+				if (i === data.remixes.length - 1) {
+					text += _treeTextRecursive(remix, compact, deepTreeLine + "└─", deepTreeLine + "  ");
+				} else {
+					text += _treeTextRecursive(remix, compact, deepTreeLine + "├─", deepTreeLine + "│ ");
+				}
+			}
+			return text;
+		}
+	</script>
+</body>
+</html>
