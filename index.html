@@ -135,7 +135,7 @@
 	<div id="treeContainer" class="tree-container"></div>
 
 	<script type="module">
-		const MS_PER_REQUEST = 750;
+		window.MS_PER_REQUEST = 1000;
 		let trustAPI = false;
 
 		let going = false;
@@ -198,7 +198,7 @@
 		}
 		async function fetchRemixes(project, queue) {
 			if (!going) return [];
-			
+
 			const id = (project || {}).id;
 			if (isNaN(id)) {
 				throw new TypeError(`fetchRemixes: ${id} is not a number`);
